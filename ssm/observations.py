@@ -101,6 +101,7 @@ class Observations(object):
         raise NotImplementedError
 
 
+
 class GaussianObservations(Observations):
     def __init__(self, K, D, M=0):
         super(GaussianObservations, self).__init__(K, D, M)
@@ -818,6 +819,112 @@ class InputDrivenObservations(Observations):
         of latent discrete states.
         """
         raise NotImplementedError
+
+
+class BayesObservations(Observations):
+    def __init__(self, K, D, M=0, C=2):
+        super().__init__(K, D, M)
+        self.C = C
+        if self.C != 2 or self.D != 1:
+            raise NotImplementedError(
+                "BayesObservations only supports 1D binary decisions (C=2, D=1)."
+            )
+        if self.M == 0:
+            raise ValueError("BayesObservations requires input data (M>0).")
+        self.mus = npr.uniform(10, 15, size=K)
+        self.sigmas = npr.uniform(0.1, 1, size=(K, M))
+        self.gamma_ls = npr.uniform(0, 0.25, size=(K, M + 1))
+        self.gamma_rs = npr.uniform(0, 0.25, size=(K, M + 1))
+        self._bounds = self._get_bounds()
+
+    @property
+    def params(self):
+        return self.mus, self.sigmas, self.gamma_ls, self.gamma_rs
+
+    @params.setter
+    def params(self, value):
+        self.mus, self.sigmas, self.gamma_ls, self.gamma_rs = value
+
+    def permute(self, perm):
+        self.mus = self.mus[perm]
+        self.sigmas = self.sigmas[perm]
+        self.gamma_ls = self.gamma_ls[perm]
+        self.gamma_rs = self.gamma_rs[perm]
+
+    def log_prior(self):
+        return 0
+
+    def log_likelihoods(self, data, input, mask, tag):
+        probs = self.calculate_probs(input)
+        probs = probs[:, :, np.newaxis, :]
+        mask = np.ones_like(data, dtype=bool) if mask is None else mask
+        mask = mask[:, np.newaxis, :]
+        data = one_hot(data, self.C)
+        data = data[:, np.newaxis, :, :]
+        likelihoods = np.sum(probs * data, axis=-1)
+        # Can perform log after sum because only one C is 1. Avoids numerical issues.
+        log_likelihoods = np.log(likelihoods)
+        log_likelihoods = np.sum(log_likelihoods * mask, axis=-1)
+        return log_likelihoods
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        if input is not None and input.shape == (self.M,):
+            input = np.expand_dims(input, axis=0)
+        ps = self.calculate_probs(input)
+        T = ps.shape[0]
+        if T == 1:
+            z = np.array([z])
+        if with_noise:
+            sample = np.array([npr.choice(self.C, p=ps[t, z[t]]) for t in range(T)])
+        else:
+            sample = np.array([np.argmax(ps[t, z[t]]) for t in range(T)])
+        return sample
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        return super().m_step(
+            expectations,
+            datas,
+            inputs,
+            masks,
+            tags,
+            optimizer="lbfgs",
+            bounds=self._bounds,
+            **kwargs,
+        )
+
+    def calculate_probs(self, input):
+        """Return array of size TxKxC w/ P(yt=C|zt=k) given input of size TxM."""
+
+        def _norm_cdf(x, mu, sigma):
+            return 0.5 * (1 + erf((x - mu) / (np.sqrt(2) * sigma)))
+
+        if self.M != input.shape[1]:
+            raise ValueError(f"Expected input of size {self.M}, got {input.shape[1]}.")
+        precisions = 1 / (self.sigmas**2)
+        precisions = precisions[:, np.newaxis, :]
+        mask = (input > 0).astype(int)
+        precision_opt = np.sum(precisions * mask, axis=-1)
+        sigma_opt = 1 / np.sqrt(precision_opt)
+        input_opt = np.sum(input * mask * precisions, axis=-1) / precision_opt
+        mus = self.mus[:, np.newaxis]
+        probs = _norm_cdf(input_opt, mus, sigma_opt)
+
+        cond = np.zeros(input.shape[0], dtype=int)
+        cond[input[:, 1] > 0] = 1
+        cond[np.all(input > 0, axis=1)] = 2
+        gls = self.gamma_ls[:, cond]
+        grs = self.gamma_rs[:, cond]
+
+        probs = gls + (1 - gls - grs) * probs
+        probs = np.stack([1 - probs, probs], axis=-1)
+        return np.transpose(probs, (1, 0, 2))
+
+    def _get_bounds(self):
+        bounds = [(None, None)] * self.K  # mus
+        bounds += [(1e-5, None)] * (self.K * self.M)  # sigmas
+        bounds += [(0, 0.5)] * (self.K * (self.M + 1))  # gamma_ls
+        bounds += [(0, 0.5)] * (self.K * (self.M + 1))  # gamma_rs
+        return bounds
 
 
 class _AutoRegressiveObservationsBase(Observations):
