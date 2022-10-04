@@ -465,7 +465,9 @@ class HMM(object):
               pbar.set_description("LP: {:.1f}".format(lls[-1]))
 
             # Check for convergence
-            if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
+            diff = np.abs(lls[-1] - lls[-2])
+            denom = np.max([np.abs(lls[-1]), np.abs(lls[-2]), 1])
+            if itr > 0 and diff / denom < tolerance:
                 if verbose == 2:
                   pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
                 break
